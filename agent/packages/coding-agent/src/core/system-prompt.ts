@@ -9,13 +9,29 @@ import { formatSkillsForPrompt, type Skill } from "./skills.js";
 function grepTaskKeywords(cwd: string, taskText: string): string {
 	try {
 		const backtickMatches = taskText.match(/`([^`]{2,60})`/g)?.map(k => k.replace(/`/g, '')) || [];
+		const explicitTaskPaths = [...new Set(
+			backtickMatches.filter(
+				(k) =>
+					/[\\/]/.test(k) ||
+					/\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py|pyi|go|java|kt|kts|rb|cs|fs|vue|svelte|json|ya?ml|toml|rs|swift|php|md|gradle|properties)$/i.test(
+						k,
+					),
+			),
+		)].slice(0, 12);
+		let prefix = "";
+		if (explicitTaskPaths.length > 0) {
+			prefix =
+				"\n\n## Paths named in the task\n\nRead these first (no extra discovery needed if the task is explicit):\n" +
+				explicitTaskPaths.map((p) => `- \`${p}\`\n`).join("") +
+				"\n";
+		}
 		const camelMatches = taskText.match(/\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b/g) || [];
 		const snakeMatches = taskText.match(/\b[a-z]+_[a-z_]+\b/g) || [];
 		const allKeywords = [...new Set([...backtickMatches, ...camelMatches, ...snakeMatches])]
 			.filter(k => k.length >= 3 && k.length <= 60)
 			.filter(k => !['the', 'and', 'for', 'with', 'that', 'this', 'from', 'should', 'must', 'when', 'each', 'into', 'also'].includes(k.toLowerCase()))
 			.slice(0, 10);
-		if (allKeywords.length === 0) return "";
+		if (allKeywords.length === 0) return prefix;
 		const fileHits = new Map<string, string[]>();
 		for (const keyword of allKeywords) {
 			try {
@@ -33,13 +49,14 @@ function grepTaskKeywords(cwd: string, taskText: string): string {
 				}
 			} catch {}
 		}
-		if (fileHits.size === 0) return "";
+		if (fileHits.size === 0) return prefix;
 		const sorted = [...fileHits.entries()].sort((a, b) => b[1].length - a[1].length).slice(0, 15);
-		let result = "\n\n## Files matching task keywords\n\nThese files contain identifiers from the task. Start here:\n";
+		let result =
+			"\n\n## Files matching task keywords\n\nThese files contain identifiers from the task. Start here:\n";
 		for (const [file, keywords] of sorted) {
 			result += `- ${file} (${keywords.join(", ")})\n`;
 		}
-		return result + "\n";
+		return prefix + result + "\n";
 	} catch {}
 	return "";
 }
@@ -70,6 +87,13 @@ const TAU_SCORING_PREAMBLE = `# tau / sn66 optimized strategy
 
 You are running inside the tau SWE harness on Bittensor subnet 66. Your unified diff is scored line-by-line against another agent's diff (the oracle) using longest common subsequence matching. Whoever has more matched changed lines wins. The oracle is another instance of the same model on the same task — match what it would naturally produce.
 
+## Priority (when instructions seem to conflict)
+
+1. **Never ship an empty diff** — some correct lines beat zero.
+2. **Right files only** — touch files the task names or clearly implies; extra files are pure bloat.
+3. **Positional alignment** — same order, style, and minimal changed lines as the oracle would produce.
+4. **Full coverage** — every acceptance criterion, then stop (no tests, no summaries).
+
 ## Speed matters — you may have as little as 40 seconds
 
 Your time budget varies per task (40–300 seconds). You do NOT know how much time you have. An empty diff scores 0. Therefore:
@@ -79,7 +103,9 @@ Your time budget varies per task (40–300 seconds). You do NOT know how much ti
 
 ## Mandatory file discovery (BEFORE any edit)
 
-Before your first edit, run a quick search:
+If the task or system context already lists exact file paths, **call \`read\` on those paths first** — skip broad find/grep when unnecessary.
+
+Before your first edit (when paths are still unclear), run a quick search:
 - find . -type f \( -name "*.EXT" -o -name "Dockerfile" -o -name "*.sh" -o -name "*.json" \) | grep -v node_modules | grep -v .git | head -60
 - grep -r "KEYWORD" --include="*.EXT" -l | head -10
 This costs 1 tool call but prevents editing the wrong file (which costs the entire round).

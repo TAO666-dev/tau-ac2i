@@ -150,6 +150,37 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 }
 
 /**
+ * Parse find/grep/ls output into likely repo-relative file paths.
+ * Broader than extension-only matching (Dockerfile, paths with slashes, etc.).
+ */
+function extractCandidatePathsFromBashOutput(output: string, max = 24): string[] {
+	const paths: string[] = [];
+	const seen = new Set<string>();
+	for (const raw of output.split("\n")) {
+		let line = raw.trim();
+		if (!line || line.length > 280) continue;
+		if (/^(find:|grep:|bash:)/i.test(line)) continue;
+		if (line.startsWith("/usr/") || line.startsWith("/bin/") || line.startsWith("/etc/")) continue;
+		if (/^total \d+$/i.test(line)) continue;
+		line = line.replace(/^\.\/+/, "");
+		if (line.includes("node_modules") || line.includes("/.git/") || line === ".git") continue;
+		const base = line.split("/").pop() ?? line;
+		const knownRootFiles = /^(dockerfile|makefile|license|readme\.md|\.gitignore|\.env)$/i.test(base);
+		const hasFileExt = /\.[A-Za-z0-9]{1,12}$/.test(line);
+		const pathLike =
+			/^[\w@./+,-]+$/.test(line) &&
+			line.length >= 2 &&
+			(line.includes("/") || hasFileExt || knownRootFiles);
+		if (!pathLike) continue;
+		if (seen.has(line)) continue;
+		seen.add(line);
+		paths.push(line);
+		if (paths.length >= max) break;
+	}
+	return paths;
+}
+
+/**
  * Main loop logic shared by agentLoop and agentLoopContinue.
  */
 async function runLoop(
@@ -186,13 +217,21 @@ async function runLoop(
 	const MAX_NO_TOOL_RETRIES = 2;
 	const MAX_READS_BEFORE_EDIT = 2;
 
-	// tau/sn66 v17: wall-clock time pressure. The validator kills us at
-	// min(cursor_time*2, 300s) but we don't know the exact budget. We
-	// assume worst case ~120s and inject urgency at 60% of that. If we
-	// haven't edited by 80s, we MUST edit something or we lose.
+	// tau/sn66 v17: wall-clock time pressure. Validator budget is unknown;
+	// inject escalating urgency early (TIME_WARNING_MS / PANIC_EDIT_MS) so
+	// we rarely end with an empty diff; HARD_EXIT_MS preserves the patch.
 	const loopStartTime = Date.now();
 	let timeWarningInjected = false;
-	const TIME_WARNING_MS = 20_000;  // v2: 20s — early warning for short budgets (40-61s possible)
+	let panicEditInjected = false;
+	let panicEditInjected2 = false;
+	const filesReadPaths = new Set<string>();
+
+	// v52: phase-based workflow (from v42)
+	let phase: "discover" | "read" | "edit" = "discover";
+	let discoveredFiles: string[] = [];
+	let readFiles = new Set<string>();
+	const TIME_WARNING_MS = 8_000;  // v51b: 8s — ultra early warning
+	const PANIC_EDIT_MS = 15_000;  // v51b: 15s — trigger early, most prod tasks have 60-300s budget
 	// tau/sn66 v17: hard exit before validator kills us. If the validator
 	// kills the container, the diff is LOST (validator bug: it only collects
 	// the diff if the container is still running). By exiting gracefully
@@ -358,10 +397,57 @@ async function runLoop(
 					}
 				}
 
+				// v52: Phase transitions (from v42)
+				if (phase === "discover") {
+					for (const tr of toolResults) {
+						if (tr.toolName === "bash" && !tr.isError) {
+							const output = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
+							const paths = extractCandidatePathsFromBashOutput(output, 24);
+							if (paths.length > 0) {
+								discoveredFiles = paths.slice(0, 20);
+								phase = "read";
+								pendingMessages.push({
+									role: "user",
+									content: [{ type: "text", text: `Found ${discoveredFiles.length} files. Now READ each file you plan to edit — read ALL of them before making any edit:\n${discoveredFiles.slice(0, 10).map((p: string) => `- ${p}`).join("\n")}` }],
+									timestamp: Date.now(),
+								});
+							}
+						}
+					}
+				} else if (phase === "read") {
+					for (let pi = 0; pi < toolResults.length; pi++) {
+						const tr = toolResults[pi];
+						const tc2 = toolCalls[pi];
+						if (tr.toolName === "read" && !tr.isError && tc2?.type === "toolCall" && tc2.name === "read") {
+							const path = (tc2.arguments as any)?.path ?? "";
+							if (path && typeof path === "string") readFiles.add(path);
+						}
+						if (tr.toolName === "edit" && !tr.isError) {
+							phase = "edit";
+						}
+					}
+					const readThreshold = Math.min(Math.max(3, discoveredFiles.length > 10 ? 6 : 3), 8);
+					if (readFiles.size >= readThreshold && phase === "read" && pendingMessages.length === 0) {
+						phase = "edit";
+						pendingMessages.push({
+							role: "user",
+							content: [{ type: "text", text: `You have read ${readFiles.size} files. Call \`edit\` NOW on the first file. Do NOT write text or plans — call the edit tool directly. After editing, continue to the NEXT file until ALL acceptance criteria are covered.` }],
+							timestamp: Date.now(),
+						});
+					}
+				}
+
 				// tau/sn66 v16: track exploration budget.
-				for (const tr of toolResults) {
+				for (let i = 0; i < toolResults.length; i++) {
+					const tr = toolResults[i];
+					const tc = toolCalls[i];
 					if ((tr.toolName === "read" || tr.toolName === "bash") && !tr.isError) {
 						if (!hasEditedAnyFile) readsWithoutEdit++;
+					}
+					// v51: track read file paths for panic edit
+					if (tr.toolName === "read" && !tr.isError && tc && tc.type === "toolCall") {
+						const readPath = (tc.arguments as any)?.path;
+						if (readPath && typeof readPath === "string") filesReadPaths.add(readPath);
 					}
 				}
 
@@ -380,6 +466,41 @@ async function runLoop(
 					readsWithoutEdit = 0;
 				}
 
+				// v51b: panic edit — escalating urgency
+				// At 15s: first warning if no edit
+				// At 30s: second panic if still no edit
+				if (!hasEditedAnyFile && pendingMessages.length === 0) {
+					const elapsed = Date.now() - loopStartTime;
+					const filesList = filesReadPaths.size > 0
+						? `Files you have read: ${[...filesReadPaths].slice(0, 5).join(", ")}. `
+						: "";
+					if (!panicEditInjected && elapsed >= PANIC_EDIT_MS) {
+						panicEditInjected = true;
+						pendingMessages.push({
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: `URGENT: ${Math.round(elapsed/1000)}s elapsed with ZERO edits. An empty diff scores 0. ${filesList}Call \`edit\` NOW on the most relevant file. Even 1 correct line beats 0.`,
+								},
+							],
+							timestamp: Date.now(),
+						});
+					} else if (panicEditInjected && elapsed >= PANIC_EDIT_MS * 2 && !panicEditInjected2) {
+						panicEditInjected2 = true;
+						pendingMessages.push({
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: `FINAL WARNING: ${Math.round(elapsed/1000)}s elapsed, STILL no edits. You are about to be killed. ${filesList}Make ANY edit RIGHT NOW or score 0.`,
+								},
+							],
+							timestamp: Date.now(),
+						});
+					}
+				}
+
 				// tau/sn66 v17: hard exit — stop gracefully before validator kills us.
 				// This ensures the container is still running when the diff is collected.
 				if ((Date.now() - loopStartTime) >= HARD_EXIT_MS) {
@@ -388,16 +509,17 @@ async function runLoop(
 					return;
 				}
 
-				// tau/sn66 v17: time pressure — if we've been running for 80s
-				// without a single successful edit, inject urgency.
+				// tau/sn66 v17: time pressure — no successful edit by TIME_WARNING_MS
 				if (!hasEditedAnyFile && !timeWarningInjected && (Date.now() - loopStartTime) >= TIME_WARNING_MS && pendingMessages.length === 0) {
 					timeWarningInjected = true;
+					const elapsedSec = Math.round((Date.now() - loopStartTime) / 1000);
+					const thresholdSec = Math.round(TIME_WARNING_MS / 1000);
 					pendingMessages.push({
 						role: "user",
 						content: [
 							{
 								type: "text",
-								text: "TIME WARNING: you have been running for over 80 seconds without producing an edit. The validator will kill this process soon. You MUST call `edit` or `write` on a file RIGHT NOW or you will score 0. Pick the single most obvious target file from the task and edit it immediately. Do not read any more files.",
+								text: `TIME WARNING: ~${elapsedSec}s elapsed (${thresholdSec}s threshold) without a successful edit. The validator may kill this process soon. You MUST call \`edit\` or \`write\` on a file RIGHT NOW or you will score 0. Pick the single most obvious target file from the task and edit it immediately. Do not read any more files.`,
 							},
 						],
 						timestamp: Date.now(),
